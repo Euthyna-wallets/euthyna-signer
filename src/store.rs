@@ -19,7 +19,6 @@ pub const DEFAULT_METHODS: &[&str] = &[
     "settle",
     "settle_cancellation",
     "release_unconfirmed",
-    "clear_stale_settlement",
     "execute_queued_operation",
     "renounce_role",
 ];
@@ -232,7 +231,6 @@ mod onchain_method_tests {
             "settle",
             "settle_cancellation",
             "release_unconfirmed",
-            "clear_stale_settlement",
             "execute_queued_operation",
         ] {
             assert!(DEFAULT_METHODS.contains(&method));
