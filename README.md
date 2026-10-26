@@ -89,8 +89,8 @@ To let the signer keep the agent's API key as well, so the MCP server has no
 secret at all:
 
 ```bash
-sudo -u euthyna-signer euthyna-signer add-agent --account … --vault … \
-  --api-url https://api.euthyna.ai --api-key-stdin < api-key.txt
+sudo -u euthyna-signer euthyna-signer set-api --account naomi-agent.euthyna.testnet --api-url https://api.euthyna.ai
+# paste the API key shown once by the console, Enter, Ctrl-D
 ```
 
 The unit (`packaging/systemd/euthyna-signer.service`) runs the daemon with no

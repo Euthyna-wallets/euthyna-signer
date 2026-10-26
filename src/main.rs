@@ -60,6 +60,13 @@ enum Command {
         #[arg(long)]
         account: String,
     },
+    /// Give the signer the agent's Euthyna API key (read from standard input).
+    SetApi {
+        #[arg(long)]
+        account: String,
+        #[arg(long)]
+        api_url: String,
+    },
     /// Delete an agent's key.
     Remove {
         #[arg(long)]
@@ -173,6 +180,31 @@ async fn run(cli: Cli) -> Result<()> {
             let store = open_store(&config)?;
             let mut record = store.load(&account)?;
             record.promote()?;
+            store.save(&record)?;
+            show(&record)
+        }
+        Command::SetApi { account, api_url } => {
+            if !api_url.starts_with("https://")
+                && !api_url.starts_with("http://localhost")
+                && !api_url.starts_with("http://127.0.0.1")
+            {
+                bail!("the API URL must be https (or localhost for development)");
+            }
+            let store = open_store(&config)?;
+            let mut record = store.load(&account)?;
+            eprintln!("Paste the agent's API key, then press Enter and Ctrl-D:");
+            let mut key = String::new();
+            std::io::stdin()
+                .read_to_string(&mut key)
+                .context("read API key from stdin")?;
+            if key.trim().is_empty() {
+                bail!("no API key given");
+            }
+            record.api = Some(ApiAccess {
+                url: api_url,
+                key: key.trim().to_owned(),
+            });
+            key.zeroize();
             store.save(&record)?;
             show(&record)
         }
