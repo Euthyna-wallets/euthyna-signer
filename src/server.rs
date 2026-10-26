@@ -161,6 +161,28 @@ pub async fn handle_line(state: &State, uid: u32, line: &str) -> Value {
                 Err(error) => refuse("UNKNOWN_AGENT", error),
             }
         }
+        // Public facts only, so the MCP server needs no config but the agent's name.
+        "agent_info" => {
+            let Some(agent) = request.agent.as_deref() else {
+                return refuse("BAD_REQUEST", "agent is required");
+            };
+            match state.store.load(agent) {
+                Ok(record) => match record.public_key() {
+                    Ok(public_key) => json!({
+                        "ok": true,
+                        "agent": record.account_id,
+                        "network": record.network_id,
+                        "vault": record.vault_id,
+                        "role": record.role,
+                        "methods": record.allowed_methods,
+                        "public_key": public_key,
+                        "api": record.api.is_some(),
+                    }),
+                    Err(error) => refuse("UNKNOWN_AGENT", error),
+                },
+                Err(error) => refuse("UNKNOWN_AGENT", error),
+            }
+        }
         "sign_near_tx" => sign(state, uid, &request).await,
         "api" => api(state, uid, &request).await,
         other => {
