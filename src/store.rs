@@ -44,6 +44,9 @@ pub struct AgentRecord {
     next_secret_seed: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api: Option<ApiAccess>,
+    /// The role the agent was hired for, as the console named it (public).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 fn decode_seed(seed: &str) -> Result<SigningKey> {
@@ -91,6 +94,7 @@ impl AgentRecord {
             secret_seed: new_seed(),
             next_secret_seed: None,
             api,
+            role: None,
         }
     }
 

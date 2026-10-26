@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use euthyna_signer::pair;
 use euthyna_signer::server::{self, Config};
 use euthyna_signer::store::{AgentRecord, ApiAccess, DEFAULT_METHODS, Store, valid_account_id};
 use zeroize::Zeroize;
@@ -32,6 +33,15 @@ struct Cli {
 enum Command {
     /// Run the daemon.
     Serve,
+    /// Hire an agent with the code the console shows: makes its key here, sends
+    /// only the public key, and keeps the API key the console issues.
+    Pair {
+        /// The pairing code, EUT-….
+        code: String,
+        /// Euthyna API base URL (the console's command includes it).
+        #[arg(long)]
+        api_url: String,
+    },
     /// Create an agent key, print its PUBLIC key, then take the API key the console gives after hiring.
     AddAgent {
         /// The agent's NEAR account, as shown by the console.
@@ -125,14 +135,7 @@ fn open_store(config: &Config) -> Result<Store> {
 }
 
 fn check_api_url(url: &str) -> Result<()> {
-    if url.starts_with("https://")
-        || url.starts_with("http://localhost")
-        || url.starts_with("http://127.0.0.1")
-    {
-        Ok(())
-    } else {
-        bail!("the API URL must be https (or localhost for development)")
-    }
+    pair::check_api_url(url)
 }
 
 /// Reads one line from the terminal without echoing it.
@@ -205,6 +208,38 @@ async fn run(cli: Cli) -> Result<()> {
     let config = Config::load(&config_path(cli.config)?)?;
     match cli.command {
         Command::Serve => server::serve(config).await,
+        Command::Pair { code, api_url } => {
+            pair::check_api_url(&api_url)?;
+            let http = pair::http_client()?;
+            let store = open_store(&config)?;
+            let mut record = pair::new_unpaired_record();
+            let public_key = record.public_key()?;
+            eprintln!("  Pairing with {api_url}…");
+            let paired =
+                pair::redeem(&http, &api_url, &code, &public_key, &pair::hostname()).await?;
+            if store.exists(&paired.account_id) {
+                bail!(
+                    "{} already has a key on this machine; revoke the new hire in the console",
+                    paired.account_id
+                );
+            }
+            pair::apply(&mut record, &paired, &api_url);
+            store.save(&record)?;
+            println!(
+                "\n  Hired: {} (role {}, vault {}).",
+                record.account_id, paired.role, record.vault_id
+            );
+            println!(
+                "  Its private key stays on this machine; the API key went straight to the signer."
+            );
+            println!("  The console now creates the agent's NEAR account; keep it open.\n");
+            println!("  Then plug it into your AI (no secret in it):\n");
+            println!(
+                "      claude mcp add euthyna --env EUTHYNA_AGENT={} -- npx -y @euthyna/mcp\n",
+                record.account_id
+            );
+            Ok(())
+        }
         Command::AddAgent {
             account,
             vault,

@@ -22,7 +22,7 @@ the key, export it, or have it sign anything else.
 | The AI tries to… | Result |
 | --- | --- |
 | read the key file | `Permission denied`: the file belongs to another system user (mode 0600, directory 0700) |
-| ask the signer for the key | there is no such operation; anything but `status`, `public_key`, `sign_near_tx`, `api` is `UNKNOWN_OP` |
+| ask the signer for the key | there is no such operation; anything but `status`, `public_key`, `agent_info`, `sign_near_tx`, `api` is `UNKNOWN_OP`; `agent_info` returns public facts only |
 | have it sign a NEAR transfer, an `AddKey`, a call to another contract | refused: `ACTION_NOT_ALLOWED`, `RECEIVER_NOT_ALLOWED` |
 | have it sign a vault method outside the list | refused: `METHOD_NOT_ALLOWED` |
 | batch several actions, attach a deposit, raise the gas | refused: `TOO_MANY_ACTIONS`, `DEPOSIT_TOO_HIGH`, `GAS_TOO_HIGH` |
@@ -63,6 +63,9 @@ One JSON object per line on the socket, one reply per line.
 → {"op":"public_key","agent":"naomi-agent.euthyna.testnet"}
 ← {"ok":true,"public_key":"ed25519:…"}
 
+→ {"op":"agent_info","agent":"naomi-agent.euthyna.testnet"}
+← {"ok":true,"agent":"…","network":"testnet","vault":"acme-vault.euthyna.testnet","role":"payments","methods":[…],"public_key":"ed25519:…","api":true}
+
 → {"op":"sign_near_tx","agent":"naomi-agent.euthyna.testnet","tx_borsh_b64":"<Borsh Transaction, base64>"}
 ← {"ok":true,"signature":"ed25519:…","public_key":"ed25519:…","tx_hash":"…"}
 ← {"ok":false,"error":"METHOD_NOT_ALLOWED","detail":"ft_transfer"}
@@ -74,6 +77,38 @@ One JSON object per line on the socket, one reply per line.
 `signature` is ed25519 over `sha256(tx_borsh)`, as NEAR expects; the caller
 builds the `SignedTransaction` and sends it. NEAR's own access-key nonce
 prevents replay on chain.
+
+## Hire an agent
+
+In the Euthyna console, give the agent a name and a role, and click **Hire
+agent**. It shows a one-time command for the machine that runs the agent:
+
+```bash
+sudo euthyna-signer pair EUT-7K4Q-… --api-url https://api.euthyna.ai
+```
+
+The signer makes the key there, sends the API only the **public** key, and
+receives the agent's account, vault, role and API key. Nothing is copied by
+hand; the API key is never shown. The code works once, for 10 minutes. The
+console then creates the agent's NEAR account and checks its key on chain.
+
+Not installed on that machine yet? The console's second command installs, then
+pairs:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/joindefi/euthyna-signer/main/install.sh | sudo sh -s -- pair EUT-… --api-url https://…
+```
+
+Then plug the agent into the AI. The config holds no secret: the MCP server
+finds the socket and reads the vault, role and network from the signer.
+
+```bash
+claude mcp add euthyna --env EUTHYNA_AGENT=<agent>.testnet -- npx -y @euthyna/mcp
+```
+
+Without the console (or offline), `sudo euthyna-signer add-agent <account>
+--vault <vault> --api-url …` makes the key and prints the public key to paste
+by hand; `set-api` gives the API key later.
 
 ## Install
 
@@ -90,22 +125,12 @@ allowed to talk to it (the user who ran `sudo`, or `EUTHYNA_AGENT_USERS`),
 writes the config and starts the service. Read it first if you prefer:
 `curl -fsSL …/install.sh -o install.sh && less install.sh && sudo sh install.sh`.
 
+Running it again is safe: an installed signer, its config and its agents are
+kept, and the service is not restarted. `EUTHYNA_UPGRADE=1` installs the
+latest release; the service restarts only if something changed.
+
 On Linux the service runs with no capabilities, a read-only system and no
 access to `/home`. On Windows, use WSL 2.
-
-## Hire an agent
-
-The Euthyna console shows the command to run:
-
-```bash
-sudo euthyna-signer add-agent naomi-agent.euthyna.testnet --vault acme-vault.euthyna.testnet --api-url https://api.euthyna.ai
-```
-
-It creates the key as the signer's user (sudo is dropped before any file is
-written), prints the **public** key to paste in the console, then waits for
-the API key the console shows after hiring (typed without echo). The MCP
-config then needs no secret at all. To give or replace the API key later:
-`sudo euthyna-signer set-api <account> --api-url …`.
 
 ## Rotate a key
 

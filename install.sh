@@ -2,6 +2,10 @@
 # euthyna-signer installer (Linux with systemd, or macOS with launchd).
 #
 #   curl -fsSL https://raw.githubusercontent.com/joindefi/euthyna-signer/main/install.sh | sudo sh
+#   curl -fsSL …/install.sh | sudo sh -s -- pair EUT-… --api-url https://…   (install, then hire)
+#
+# Safe to run again: an installed signer is kept as is (agents, config, service
+# untouched) unless EUTHYNA_UPGRADE=1; the service restarts only if it changed.
 #
 # What it does, once per machine:
 #   - downloads the release binary for this OS/CPU and checks its SHA-256;
@@ -14,7 +18,16 @@
 #   EUTHYNA_SIGNER_VERSION  release tag (default: latest)
 #   EUTHYNA_SIGNER_BIN   install this local binary instead of downloading
 #   EUTHYNA_NO_SERVICE=1 write everything but do not start the service
+#   EUTHYNA_UPGRADE=1    replace an installed binary with the release one
 set -eu
+
+PAIR_CODE=""
+PAIR_API=""
+if [ "${1:-}" = pair ]; then
+  PAIR_CODE=${2:-}
+  [ "${3:-}" = --api-url ] && PAIR_API=${4:-}
+  [ -n "$PAIR_CODE" ] && [ -n "$PAIR_API" ] || { echo "usage: … | sudo sh -s -- pair <code> --api-url <url>" >&2; exit 1; }
+fi
 
 REPO="joindefi/euthyna-signer"
 say() { printf '  %s\n' "$*"; }
@@ -42,7 +55,15 @@ done
 # 1. The binary ---------------------------------------------------------------
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
-if [ -n "${EUTHYNA_SIGNER_BIN:-}" ]; then
+INSTALLED=/usr/local/bin/euthyna-signer
+KEEP=""
+# A signer too old to pair is upgraded when asked to pair.
+too_old() { [ -n "$PAIR_CODE" ] && ! "$INSTALLED" pair --help >/dev/null 2>&1; }
+if [ -x "$INSTALLED" ] && [ -z "${EUTHYNA_UPGRADE:-}" ] && [ -z "${EUTHYNA_SIGNER_BIN:-}" ] && [ -z "${EUTHYNA_SIGNER_VERSION:-}" ] && ! too_old; then
+  KEEP=1
+  say "euthyna-signer $("$INSTALLED" --version | awk '{print $2}') is already installed: keeping it (EUTHYNA_UPGRADE=1 to update)"
+  cp "$INSTALLED" "$WORK/euthyna-signer"
+elif [ -n "${EUTHYNA_SIGNER_BIN:-}" ]; then
   cp "$EUTHYNA_SIGNER_BIN" "$WORK/euthyna-signer"
 else
   command -v curl >/dev/null || die "curl is required"
@@ -69,7 +90,18 @@ chmod 0755 "$WORK/euthyna-signer"
 "$WORK/euthyna-signer" --version >/dev/null || die "the binary does not run on this machine"
 
 # 2. Users, directories, config ----------------------------------------------
+CHANGED=""
+# Copies $1 to $2 only if they differ, and remembers that something changed.
+put() { # source dest mode
+  if ! cmp -s "$1" "$2" 2>/dev/null; then
+    install -m "$3" "$1" "$2"
+    CHANGED=1
+  fi
+}
 write_config() { # socket gid uids state audit path
+  # An existing config holds the allowed users; it is never overwritten.
+  if [ -f "$6" ]; then return; fi
+  CHANGED=1
   cat > "$6" <<JSON
 {
   "socket_path": "$1",
@@ -95,14 +127,14 @@ if [ "$OS" = Linux ]; then
   for user in $AGENT_USERS; do usermod -aG "$GROUP" "$user"; done
   GID=$(getent group "$GROUP" | cut -d: -f3)
 
-  install -m 0755 "$WORK/euthyna-signer" /usr/local/bin/euthyna-signer
+  put "$WORK/euthyna-signer" /usr/local/bin/euthyna-signer 0755
   install -d -m 0755 /etc/euthyna-signer
   install -d -m 0700 -o "$SIGNER_USER" -g "$GROUP" /var/lib/euthyna-signer
   install -d -m 0750 -o "$SIGNER_USER" -g "$GROUP" /var/log/euthyna-signer
   write_config /run/euthyna-signer/signer.sock "$GID" "$UIDS" /var/lib/euthyna-signer \
     /var/log/euthyna-signer/audit.log /etc/euthyna-signer/config.json
 
-  cat > /etc/systemd/system/euthyna-signer.service <<'UNIT'
+  cat > "$WORK/euthyna-signer.service" <<'UNIT'
 [Unit]
 Description=Euthyna signer: holds agent keys outside the AI's reach
 After=network-online.target
@@ -150,10 +182,15 @@ SystemCallFilter=~@privileged @resources
 [Install]
 WantedBy=multi-user.target
 UNIT
+  put "$WORK/euthyna-signer.service" /etc/systemd/system/euthyna-signer.service 0644
   if [ -z "${EUTHYNA_NO_SERVICE:-}" ]; then
-    systemctl daemon-reload
-    systemctl enable --now euthyna-signer >/dev/null
-    systemctl restart euthyna-signer
+    if [ -n "$CHANGED" ]; then
+      systemctl daemon-reload
+      systemctl enable euthyna-signer >/dev/null 2>&1
+      systemctl restart euthyna-signer
+    else
+      systemctl enable --now euthyna-signer >/dev/null 2>&1
+    fi
   fi
   SOCKET=/run/euthyna-signer/signer.sock
 else
@@ -192,13 +229,13 @@ else
   RUN=/usr/local/var/run/euthyna-signer
   LOG=/usr/local/var/log/euthyna-signer
   install -d -m 0755 /usr/local/bin "$ETC"
-  install -m 0755 "$WORK/euthyna-signer" /usr/local/bin/euthyna-signer
+  put "$WORK/euthyna-signer" /usr/local/bin/euthyna-signer 0755
   install -d -m 0700 -o "$SIGNER_USER" -g "$GROUP" "$STATE"
   install -d -m 0750 -o "$SIGNER_USER" -g "$GROUP" "$RUN" "$LOG"
   write_config "$RUN/signer.sock" "$GID" "$UIDS" "$STATE" "$LOG/audit.log" "$ETC/config.json"
 
   PLIST=/Library/LaunchDaemons/ai.euthyna.signer.plist
-  cat > "$PLIST" <<PLIST
+  cat > "$WORK/plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -220,18 +257,24 @@ else
 </dict>
 </plist>
 PLIST
+  put "$WORK/plist" "$PLIST" 0644
   chown root:wheel "$PLIST"
-  chmod 0644 "$PLIST"
   if [ -z "${EUTHYNA_NO_SERVICE:-}" ]; then
-    launchctl bootout system "$PLIST" 2>/dev/null || true
-    launchctl bootstrap system "$PLIST"
+    if [ -n "$CHANGED" ] || ! launchctl print system/ai.euthyna.signer >/dev/null 2>&1; then
+      launchctl bootout system "$PLIST" 2>/dev/null || true
+      launchctl bootstrap system "$PLIST"
+    fi
   fi
   SOCKET="$RUN/signer.sock"
 fi
 
 echo
+if [ -n "$PAIR_CODE" ]; then
+  [ -n "$KEEP" ] || say "euthyna-signer is installed. Log out and back in once so $AGENT_USERS can reach it."
+  exec /usr/local/bin/euthyna-signer pair "$PAIR_CODE" --api-url "$PAIR_API"
+fi
 say "euthyna-signer $(/usr/local/bin/euthyna-signer --version | awk '{print $2}') is installed."
 say "Keys: readable only by $SIGNER_USER. Socket: $SOCKET (users: $AGENT_USERS)."
-say "Next, when you hire an agent, the console shows a command like:"
-say "  sudo euthyna-signer add-agent <agent>.testnet --vault <vault>.testnet --api-url <API>"
+say "Next, hire an agent in the console: it shows a command like"
+say "  sudo euthyna-signer pair EUT-… --api-url <API>"
 say "Log out and back in once, so $AGENT_USERS picks up the '$GROUP' group."
