@@ -75,48 +75,44 @@ One JSON object per line on the socket, one reply per line.
 builds the `SignedTransaction` and sends it. NEAR's own access-key nonce
 prevents replay on chain.
 
-## Install (Linux, systemd)
+## Install
+
+Once per machine (Linux with systemd, or macOS):
 
 ```bash
-cargo build --release
-sudo sh packaging/install-linux.sh target/release/euthyna-signer alice   # alice = the user the AI runs as
-sudo -u euthyna-signer euthyna-signer add-agent \
-  --account naomi-agent.euthyna.testnet --vault acme-vault.euthyna.testnet
-# prints the PUBLIC key to register for the agent (onboarding vote)
+curl -fsSL https://raw.githubusercontent.com/joindefi/euthyna-signer/main/install.sh | sudo sh
 ```
 
-To let the signer keep the agent's API key as well, so the MCP server has no
-secret at all:
+The script downloads the release binary for this OS and CPU, checks its
+SHA-256, creates a system user that alone can read agent keys
+(`euthyna-signer`, or `_euthyna-signer` on macOS) and a group for the users
+allowed to talk to it (the user who ran `sudo`, or `EUTHYNA_AGENT_USERS`),
+writes the config and starts the service. Read it first if you prefer:
+`curl -fsSL …/install.sh -o install.sh && less install.sh && sudo sh install.sh`.
+
+On Linux the service runs with no capabilities, a read-only system and no
+access to `/home`. On Windows, use WSL 2.
+
+## Hire an agent
+
+The Euthyna console shows the command to run:
 
 ```bash
-sudo -u euthyna-signer euthyna-signer set-api --account naomi-agent.euthyna.testnet --api-url https://api.euthyna.ai
-# paste the API key shown once by the console, Enter, Ctrl-D
+sudo euthyna-signer add-agent naomi-agent.euthyna.testnet --vault acme-vault.euthyna.testnet --api-url https://api.euthyna.ai
 ```
 
-The unit (`packaging/systemd/euthyna-signer.service`) runs the daemon with no
-capabilities, a read-only system, no access to `/home`, and its own state,
-runtime and log directories.
-
-## Install (macOS, launchd)
-
-```bash
-cargo build --release
-sudo sh packaging/install-macos.sh target/release/euthyna-signer alice
-sudo -u _euthyna-signer euthyna-signer --config /usr/local/etc/euthyna-signer/config.json \
-  add-agent --account naomi-agent.euthyna.testnet --vault acme-vault.euthyna.testnet
-```
-
-The script creates a hidden system user `_euthyna-signer` and a group
-`_euthyna` (ids in 200–399), puts the agent users in the group, writes the
-config under `/usr/local/etc/euthyna-signer`, and loads
-`/Library/LaunchDaemons/ai.euthyna.signer.plist`.
+It creates the key as the signer's user (sudo is dropped before any file is
+written), prints the **public** key to paste in the console, then waits for
+the API key the console shows after hiring (typed without echo). The MCP
+config then needs no secret at all. To give or replace the API key later:
+`sudo euthyna-signer set-api <account> --api-url …`.
 
 ## Rotate a key
 
 ```bash
-sudo -u euthyna-signer euthyna-signer rotate  --account naomi-agent.euthyna.testnet   # prints the next key
+sudo euthyna-signer rotate naomi-agent.euthyna.testnet    # prints the next key
 # register the next key by vote, then:
-sudo -u euthyna-signer euthyna-signer promote --account naomi-agent.euthyna.testnet
+sudo euthyna-signer promote naomi-agent.euthyna.testnet
 ```
 
 ## Develop

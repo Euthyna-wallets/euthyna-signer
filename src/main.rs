@@ -1,12 +1,18 @@
-use std::io::Read as _;
+use std::io::{BufRead as _, IsTerminal as _, Write as _};
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use euthyna_signer::server::{self, Config};
 use euthyna_signer::store::{AgentRecord, ApiAccess, DEFAULT_METHODS, Store, valid_account_id};
 use zeroize::Zeroize;
+
+/// Where the installers put the config, Linux first.
+const CONFIG_PATHS: &[&str] = &[
+    "/etc/euthyna-signer/config.json",
+    "/usr/local/etc/euthyna-signer/config.json",
+];
 
 #[derive(Parser)]
 #[command(
@@ -15,8 +21,9 @@ use zeroize::Zeroize;
     about = "Keeps Euthyna agent keys away from the AI; signs only vault requests."
 )]
 struct Cli {
-    #[arg(long, global = true, default_value = "/etc/euthyna-signer/config.json")]
-    config: PathBuf,
+    /// Config file (default: /etc/euthyna-signer/config.json, then /usr/local/etc/…).
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -25,67 +32,145 @@ struct Cli {
 enum Command {
     /// Run the daemon.
     Serve,
-    /// Create an agent key. Prints the PUBLIC key to register by vote.
+    /// Create an agent key, print its PUBLIC key, then take the API key the console gives after hiring.
     AddAgent {
-        #[arg(long)]
+        /// The agent's NEAR account, as shown by the console.
         account: String,
+        /// The company vault: the only contract this key may call.
         #[arg(long)]
         vault: String,
+        /// Euthyna API base URL; the signer keeps the agent's API key for it.
+        #[arg(long)]
+        api_url: Option<String>,
         #[arg(long, default_value = "testnet")]
         network: String,
         /// Vault methods the key may call (comma separated).
         #[arg(long, value_delimiter = ',')]
         methods: Option<Vec<String>>,
-        /// Euthyna API base URL; with --api-key-stdin the signer keeps the agent's API key too.
-        #[arg(long)]
-        api_url: Option<String>,
-        /// Read the agent's API key from standard input (never from the command line).
-        #[arg(long)]
-        api_key_stdin: bool,
     },
     /// List agents.
     List,
     /// Show an agent's public data (never the secret).
-    Show {
-        #[arg(long)]
-        account: String,
-    },
+    Show { account: String },
     /// Generate the next key; it signs only after `promote`.
-    Rotate {
-        #[arg(long)]
-        account: String,
-    },
+    Rotate { account: String },
     /// Switch to the key made by `rotate` (once it is registered on chain).
-    Promote {
-        #[arg(long)]
-        account: String,
-    },
-    /// Give the signer the agent's Euthyna API key (read from standard input).
+    Promote { account: String },
+    /// Give (or replace) the agent's Euthyna API key.
     SetApi {
-        #[arg(long)]
         account: String,
         #[arg(long)]
         api_url: String,
     },
     /// Delete an agent's key.
-    Remove {
-        #[arg(long)]
-        account: String,
-    },
+    Remove { account: String },
 }
 
-/// Admin commands must run as the signer's own user, so the files they write
-/// stay readable by the daemon and by nobody else.
-fn open_store(config: &Config) -> Result<Store> {
-    let store = Store::open(&config.state_dir)?;
-    let owner = std::fs::metadata(&config.state_dir)?.uid();
+fn config_path(given: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = given {
+        return Ok(path);
+    }
+    CONFIG_PATHS
+        .iter()
+        .map(PathBuf::from)
+        .find(|path| path.exists())
+        .context("euthyna-signer is not installed here (no config in /etc/euthyna-signer or /usr/local/etc/euthyna-signer)")
+}
+
+/// Admin commands run as the signer's own user, so the files they write stay
+/// readable by the daemon and by nobody else. Started with sudo, they drop to
+/// that user before touching anything.
+fn become_owner(state_dir: &Path) -> Result<()> {
+    let meta = std::fs::metadata(state_dir).with_context(|| {
+        format!(
+            "{} is missing: is euthyna-signer installed?",
+            state_dir.display()
+        )
+    })?;
+    let (owner, group) = (meta.uid(), meta.gid());
     let me = unsafe { libc::geteuid() };
-    if owner != me {
+    if me == owner {
+        return Ok(());
+    }
+    if me != 0 {
+        bail!("run it with sudo: `sudo euthyna-signer …`");
+    }
+    if owner == 0 {
         bail!(
-            "run this as the signer's user (uid {owner}), e.g. `sudo -u euthyna-signer euthyna-signer ...`; you are uid {me}"
+            "{} belongs to root: reinstall euthyna-signer",
+            state_dir.display()
         );
     }
-    Ok(store)
+    // Order matters: supplementary groups and gid while still root, uid last.
+    unsafe {
+        if libc::setgroups(0, std::ptr::null()) != 0
+            || libc::setgid(group) != 0
+            || libc::setuid(owner) != 0
+        {
+            bail!(
+                "could not switch to the signer's user: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        if libc::setuid(0) == 0 {
+            bail!("privileges were not dropped");
+        }
+    }
+    Ok(())
+}
+
+fn open_store(config: &Config) -> Result<Store> {
+    become_owner(&config.state_dir)?;
+    Store::open(&config.state_dir)
+}
+
+fn check_api_url(url: &str) -> Result<()> {
+    if url.starts_with("https://")
+        || url.starts_with("http://localhost")
+        || url.starts_with("http://127.0.0.1")
+    {
+        Ok(())
+    } else {
+        bail!("the API URL must be https (or localhost for development)")
+    }
+}
+
+/// Reads one line from the terminal without echoing it.
+fn read_secret_line() -> Result<String> {
+    let stdin = std::io::stdin();
+    let fd = libc::STDIN_FILENO;
+    let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+    let tty = stdin.is_terminal() && unsafe { libc::tcgetattr(fd, &mut saved) } == 0;
+    if tty {
+        let mut quiet = saved;
+        quiet.c_lflag &= !libc::ECHO;
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) };
+    }
+    let mut line = String::new();
+    let read = stdin.lock().read_line(&mut line);
+    if tty {
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &saved) };
+        eprintln!();
+    }
+    read.context("read the API key")?;
+    let key = line.trim().to_owned();
+    line.zeroize();
+    Ok(key)
+}
+
+fn ask_api_key(record: &mut AgentRecord, url: String) -> Result<bool> {
+    eprint!("API key (input hidden; Enter alone to skip): ");
+    std::io::stderr().flush().ok();
+    let mut key = read_secret_line()?;
+    if key.is_empty() {
+        return Ok(false);
+    }
+    record.api = Some(ApiAccess {
+        url,
+        key: key.clone(),
+    });
+    key.zeroize();
+    Ok(true)
 }
 
 fn show(record: &AgentRecord) -> Result<()> {
@@ -117,49 +202,57 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    let config = Config::load(&cli.config)?;
+    let config = Config::load(&config_path(cli.config)?)?;
     match cli.command {
         Command::Serve => server::serve(config).await,
         Command::AddAgent {
             account,
             vault,
+            api_url,
             network,
             methods,
-            api_url,
-            api_key_stdin,
         } => {
             if !valid_account_id(&account) || !valid_account_id(&vault) {
                 bail!("invalid NEAR account id");
+            }
+            if let Some(url) = &api_url {
+                check_api_url(url)?;
             }
             let store = open_store(&config)?;
             if store.exists(&account) {
                 bail!("{account} already exists: use `rotate` for a new key");
             }
-            let api = match (api_url, api_key_stdin) {
-                (Some(url), true) => {
-                    let mut key = String::new();
-                    std::io::stdin()
-                        .read_to_string(&mut key)
-                        .context("read API key from stdin")?;
-                    let access = ApiAccess {
-                        url,
-                        key: key.trim().to_owned(),
-                    };
-                    key.zeroize();
-                    Some(access)
-                }
-                (Some(_), false) => bail!("--api-url needs --api-key-stdin"),
-                (None, true) => bail!("--api-key-stdin needs --api-url"),
-                (None, false) => None,
-            };
             let methods =
                 methods.unwrap_or_else(|| DEFAULT_METHODS.iter().map(|m| m.to_string()).collect());
-            let record = AgentRecord::new(&account, &network, &vault, methods, api);
+            let mut record = AgentRecord::new(&account, &network, &vault, methods, None);
             store.save(&record)?;
-            show(&record)?;
             println!(
-                "\nRegister this public key for {account} (agent onboarding vote); the key itself never leaves this machine."
+                "\n  Public key for {account}:\n\n      {}\n",
+                record.public_key()?
             );
+            println!("  1. Paste it in the Euthyna console and hire the agent.");
+            println!("     The private key never leaves this machine; the AI cannot read it.");
+            let Some(url) = api_url else {
+                println!(
+                    "  2. Then give the signer the agent's API key:\n     sudo euthyna-signer set-api {account} --api-url <Euthyna API URL>"
+                );
+                return Ok(());
+            };
+            if !std::io::stdin().is_terminal() {
+                println!("  2. Then: sudo euthyna-signer set-api {account} --api-url {url}");
+                return Ok(());
+            }
+            println!("  2. The console then shows the agent's API key once. Paste it here:\n");
+            if ask_api_key(&mut record, url.clone())? {
+                store.save(&record)?;
+                println!(
+                    "\n  Done. The signer holds the key and the API key; the MCP config needs no secret."
+                );
+            } else {
+                println!(
+                    "\n  Skipped. Later: sudo euthyna-signer set-api {account} --api-url {url}"
+                );
+            }
             Ok(())
         }
         Command::List => {
@@ -184,27 +277,12 @@ async fn run(cli: Cli) -> Result<()> {
             show(&record)
         }
         Command::SetApi { account, api_url } => {
-            if !api_url.starts_with("https://")
-                && !api_url.starts_with("http://localhost")
-                && !api_url.starts_with("http://127.0.0.1")
-            {
-                bail!("the API URL must be https (or localhost for development)");
-            }
+            check_api_url(&api_url)?;
             let store = open_store(&config)?;
             let mut record = store.load(&account)?;
-            eprintln!("Paste the agent's API key, then press Enter and Ctrl-D:");
-            let mut key = String::new();
-            std::io::stdin()
-                .read_to_string(&mut key)
-                .context("read API key from stdin")?;
-            if key.trim().is_empty() {
+            if !ask_api_key(&mut record, api_url)? {
                 bail!("no API key given");
             }
-            record.api = Some(ApiAccess {
-                url: api_url,
-                key: key.trim().to_owned(),
-            });
-            key.zeroize();
             store.save(&record)?;
             show(&record)
         }

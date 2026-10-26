@@ -1,0 +1,41 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: macos-latest, target: x86_64-apple-darwin }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo test --locked
+        if: matrix.target != 'x86_64-apple-darwin'
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name=euthyna-signer-${{ matrix.target }}.tar.gz
+          tar -czf "$name" -C target/${{ matrix.target }}/release euthyna-signer
+          if command -v sha256sum >/dev/null; then sha256sum "$name" > "$name.sha256"; else shasum -a 256 "$name" > "$name.sha256"; fi
+      - name: Upload to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --notes "euthyna-signer $TAG" || true
+          gh release upload "$TAG" euthyna-signer-${{ matrix.target }}.tar.gz euthyna-signer-${{ matrix.target }}.tar.gz.sha256 --clobber
