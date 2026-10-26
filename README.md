@@ -47,7 +47,10 @@ movements. A stolen request is still bounded by the role.
   or access to Docker (membership of the `docker` group is root).
 - An agent running **as the `euthyna-signer` user** can read the key. Run the
   agent as a normal user.
-- On Linux and macOS only (Unix sockets and peer credentials).
+- An agent that can run `sudo` can become root. Run the agent as a user
+  without `sudo`, or at least without cached `sudo` (`Defaults timestamp_timeout=0`).
+- Linux and macOS (Unix sockets and kernel peer credentials). On Windows, run
+  the agent and the signer in WSL 2 for now.
 
 ## Protocol
 
@@ -94,9 +97,19 @@ The unit (`packaging/systemd/euthyna-signer.service`) runs the daemon with no
 capabilities, a read-only system, no access to `/home`, and its own state,
 runtime and log directories.
 
-macOS: `packaging/macos/ai.euthyna.signer.plist` runs it under launchd as a
-dedicated `_euthyna-signer` user; create that user and the config by hand for
-now.
+## Install (macOS, launchd)
+
+```bash
+cargo build --release
+sudo sh packaging/install-macos.sh target/release/euthyna-signer alice
+sudo -u _euthyna-signer euthyna-signer --config /usr/local/etc/euthyna-signer/config.json \
+  add-agent --account naomi-agent.euthyna.testnet --vault acme-vault.euthyna.testnet
+```
+
+The script creates a hidden system user `_euthyna-signer` and a group
+`_euthyna` (ids in 200–399), puts the agent users in the group, writes the
+config under `/usr/local/etc/euthyna-signer`, and loads
+`/Library/LaunchDaemons/ai.euthyna.signer.plist`.
 
 ## Rotate a key
 
@@ -113,4 +126,4 @@ cargo test          # policy, decoder against near-api-js bytes, socket UID chec
 cargo clippy --all-targets -- -D warnings
 ```
 
-Rust edition 2024, Rust 1.97 or later.
+Rust edition 2024, Rust 1.99.1 (pinned in `rust-toolchain.toml`).

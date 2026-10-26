@@ -2,7 +2,7 @@
 name = "euthyna-signer"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.99"
 license = "Apache-2.0"
 description = "Holds Euthyna agent keys outside the AI's reach and signs only vault requests."
 publish = false

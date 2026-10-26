@@ -4,7 +4,7 @@
 <dict>
   <key>Label</key><string>ai.euthyna.signer</string>
   <key>UserName</key><string>_euthyna-signer</string>
-  <key>GroupName</key><string>_euthyna-signer</string>
+  <key>GroupName</key><string>_euthyna</string>
   <key>ProgramArguments</key>
   <array>
     <string>/usr/local/bin/euthyna-signer</string>
