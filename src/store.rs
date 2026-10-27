@@ -16,6 +16,10 @@ pub const DEFAULT_METHODS: &[&str] = &[
     "authorize",
     "cancel_prepared",
     "cancel_nonce",
+    "settle",
+    "settle_cancellation",
+    "release_unconfirmed",
+    "execute_queued_operation",
     "renounce_role",
 ];
 /// 300 Tgas: the protocol maximum for one transaction.
@@ -215,5 +219,23 @@ impl Store {
         }
         out.sort();
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod onchain_method_tests {
+    use super::DEFAULT_METHODS;
+    #[test]
+    fn defaults_allow_permissionless_vault_settlement() {
+        for method in [
+            "settle",
+            "settle_cancellation",
+            "release_unconfirmed",
+            "execute_queued_operation",
+        ] {
+            assert!(DEFAULT_METHODS.contains(&method));
+        }
+        assert!(!DEFAULT_METHODS.contains(&"report_status"));
+        assert!(!DEFAULT_METHODS.contains(&"queue_rule_change"));
     }
 }
