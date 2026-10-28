@@ -139,6 +139,9 @@ if [ "$OS" = Linux ]; then
 Description=Euthyna signer: holds agent keys outside the AI's reach
 After=network-online.target
 Wants=network-online.target
+# A failing start stops after 5 tries in a minute instead of looping forever.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -178,6 +181,10 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
+# Assignments merge in order: re-allow chown only, removed by ~@privileged above.
+# The signer gives its socket to the euthyna group (socket_gid); without this it
+# is killed at start. No capability is granted: it can only pick a group it is in.
+SystemCallFilter=@chown
 
 [Install]
 WantedBy=multi-user.target
