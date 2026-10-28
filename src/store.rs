@@ -21,6 +21,9 @@ pub const DEFAULT_METHODS: &[&str] = &[
     "release_unconfirmed",
     "execute_queued_operation",
     "renounce_role",
+    "execute_solana",
+    "settle_solana",
+    "release_solana_unconfirmed",
 ];
 /// 300 Tgas: the protocol maximum for one transaction.
 pub const DEFAULT_MAX_GAS: u64 = 300_000_000_000_000;
