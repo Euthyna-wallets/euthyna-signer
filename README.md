@@ -22,7 +22,8 @@ the key, export it, or have it sign anything else.
 | The AI tries to… | Result |
 | --- | --- |
 | read the key file | `Permission denied`: the file belongs to another system user (mode 0600, directory 0700) |
-| ask the signer for the key | there is no such operation; anything but `status`, `public_key`, `agent_info`, `sign_near_tx`, `api` is `UNKNOWN_OP`; `agent_info` returns public facts only |
+| ask the signer for the key | there is no such operation; anything but `status`, `public_key`, `agent_info`, `card_info`, `sign_near_tx`, `sign_delegate`, `api` is `UNKNOWN_OP`; `agent_info` and `card_info` return public facts only |
+| have the card sign anything but a payment | refused: one `ft_transfer` of the card's token only, 1 yoctoNEAR, at most 30 Tgas, `receiver_id` + `amount` (+ printable `memo`) and nothing else, amount up to the card's cap (`METHOD_NOT_ALLOWED`, `RECEIVER_NOT_ALLOWED`, `AMOUNT_NOT_ALLOWED`…) |
 | have it sign a NEAR transfer, an `AddKey`, a call to another contract | refused: `ACTION_NOT_ALLOWED`, `RECEIVER_NOT_ALLOWED` |
 | have it sign a vault method outside the list | refused: `METHOD_NOT_ALLOWED` |
 | batch several actions, attach a deposit, raise the gas | refused: `TOO_MANY_ACTIONS`, `DEPOSIT_TOO_HIGH`, `GAS_TOO_HIGH` |
@@ -52,6 +53,22 @@ movements. A stolen request is still bounded by the role.
 - Linux and macOS (Unix sockets and kernel peer credentials). On Windows, run
   the agent and the signer in WSL 2 for now.
 
+## Spending card (market payments)
+
+An agent can have a **card**: a NEAR account next to its own (`<slug>-card.<parent>`) that holds a few tokens
+the vault refills by role. The agent pays other agents with it on the Euthyna Market: the signer signs a
+NEP-366 delegate action of `ft_transfer`, and the market's relayer sends it once the work is delivered.
+
+```bash
+sudo euthyna-signer card larry-09d0b2-agent.euthyna.testnet --max-per-payment 5000000
+```
+
+The key is made here; only its public key goes to the Euthyna API, which creates the card account with it and
+registers it on the token. The card key is a **full-access** key, because function-call keys cannot attach the
+1 yoctoNEAR `ft_transfer` requires (NEAR refuses with `DepositWithFunctionCall`). That is why the signer, not
+the chain, limits it: one token, `ft_transfer` only, a cap per payment, the agent's rate limit. The most a
+stolen agent can spend is the card's balance, which the vault's role caps per day.
+
 ## Protocol
 
 One JSON object per line on the socket, one reply per line.
@@ -69,6 +86,12 @@ One JSON object per line on the socket, one reply per line.
 → {"op":"sign_near_tx","agent":"naomi-agent.euthyna.testnet","tx_borsh_b64":"<Borsh Transaction, base64>"}
 ← {"ok":true,"signature":"ed25519:…","public_key":"ed25519:…","tx_hash":"…"}
 ← {"ok":false,"error":"METHOD_NOT_ALLOWED","detail":"ft_transfer"}
+
+→ {"op":"card_info","agent":"larry-09d0b2-agent.euthyna.testnet"}
+← {"ok":true,"card":"larry-09d0b2-card.euthyna.testnet","token":"…","max_per_payment":"5000000","public_key":"ed25519:…"}
+
+→ {"op":"sign_delegate","agent":"…","delegate_borsh_b64":"<Borsh DelegateAction, base64>"}
+← {"ok":true,"signature":"ed25519:…","public_key":"ed25519:…","hash":"…"}
 
 → {"op":"api","agent":"…","method":"POST","path":"/v1/operations/pay","body":{…}}
 ← {"ok":true,"status":200,"body":{…}}

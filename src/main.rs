@@ -6,7 +6,9 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use euthyna_signer::pair;
 use euthyna_signer::server::{self, Config};
-use euthyna_signer::store::{AgentRecord, ApiAccess, DEFAULT_METHODS, Store, valid_account_id};
+use euthyna_signer::store::{
+    self, AgentRecord, ApiAccess, DEFAULT_METHODS, Store, valid_account_id,
+};
 use zeroize::Zeroize;
 
 /// Where the installers put the config, Linux first.
@@ -71,6 +73,21 @@ enum Command {
         account: String,
         #[arg(long)]
         api_url: String,
+    },
+    /// Give the agent a spending card: a key made here, a NEAR account the
+    /// Euthyna API creates with it, and a cap per payment. The card signs only
+    /// `ft_transfer` of one token (market payments), never anything else.
+    Card {
+        account: String,
+        /// The NEP-141 token the card pays with (default: Circle's USDC on testnet).
+        #[arg(
+            long,
+            default_value = "3e2210e1184b45b64c8a434c0a7e7b23cc04ea7eb7a6c3c32520d03d4afcb8af"
+        )]
+        token: String,
+        /// Largest single payment, in the token's base units (default 5 USDC).
+        #[arg(long, default_value_t = 5_000_000)]
+        max_per_payment: u128,
     },
     /// Delete an agent's key.
     Remove { account: String },
@@ -182,6 +199,16 @@ fn show(record: &AgentRecord) -> Result<()> {
     println!("vault       {}", record.vault_id);
     println!("methods     {}", record.allowed_methods.join(", "));
     println!("public key  {}", record.public_key()?);
+    if let Some(card) = record
+        .card
+        .as_ref()
+        .filter(|card| !card.account_id.is_empty())
+    {
+        println!(
+            "card        {} ({}, at most {} a payment)",
+            card.account_id, card.token, card.max_per_payment
+        );
+    }
     if let Some(next) = record.next_public_key()? {
         println!("next key    {next}  (not signing yet: register it, then `promote`)");
     }
@@ -320,6 +347,72 @@ async fn run(cli: Cli) -> Result<()> {
             }
             store.save(&record)?;
             show(&record)
+        }
+        Command::Card {
+            account,
+            token,
+            max_per_payment,
+        } => {
+            if !valid_account_id(&token) || max_per_payment == 0 {
+                bail!("invalid token or cap");
+            }
+            let store = open_store(&config)?;
+            let mut record = store.load(&account)?;
+            if record
+                .card
+                .as_ref()
+                .is_some_and(|card| !card.account_id.is_empty())
+            {
+                bail!("{account} already has a card; remove it first");
+            }
+            let Some(api) = record.api.clone() else {
+                bail!(
+                    "{account} has no API key: the API creates the card's account (set-api first)"
+                );
+            };
+            // The key is made and saved before the account exists, so a failed call can be retried.
+            let mut card = record
+                .card
+                .take()
+                .filter(|card| card.token == token)
+                .unwrap_or_else(|| store::CardRecord::unassigned(&token, max_per_payment));
+            let public_key = card.public_key()?;
+            record.card = Some(card.clone());
+            store.save(&record)?;
+            let http = pair::http_client()?;
+            let response = http
+                .post(format!("{}/v1/agent/card", api.url.trim_end_matches('/')))
+                .header("x-api-key", api.key.as_str())
+                .json(&serde_json::json!({ "publicKey": public_key, "token": token }))
+                .send()
+                .await
+                .context("reach the Euthyna API")?;
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.unwrap_or_default();
+            if !status.is_success() {
+                bail!(
+                    "the API refused the card ({status}): {}",
+                    body["message"]
+                        .as_str()
+                        .or(body["error"].as_str())
+                        .unwrap_or("no detail")
+                );
+            }
+            let Some(card_account) = body["cardAccountId"]
+                .as_str()
+                .filter(|id| valid_account_id(id))
+            else {
+                bail!("the API answered without a card account");
+            };
+            card = store::CardRecord::with_account(card, card_account, max_per_payment);
+            record.card = Some(card.clone());
+            store.save(&record)?;
+            println!("\n  Card ready: {card_account}");
+            println!("  It pays with {token}, at most {max_per_payment} base units a payment.");
+            println!(
+                "  Its key stays here. Refill it from the vault with a role (Rules → Pay in NEAR tokens → the agent's card).\n"
+            );
+            Ok(())
         }
         Command::Remove { account } => {
             open_store(&config)?.remove(&account)?;
