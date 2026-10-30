@@ -358,7 +358,7 @@ dependencies = [
 
 [[package]]
 name = "euthyna-signer"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64",

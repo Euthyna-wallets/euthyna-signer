@@ -159,6 +159,91 @@ pub fn decode(bytes: &[u8]) -> Result<Transaction, DecodeError> {
     })
 }
 
+/// A NEP-366 delegate action: the transaction a card signs for a relayer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegateAction {
+    pub sender_id: String,
+    pub receiver_id: String,
+    pub actions: Vec<Action>,
+    pub nonce: u64,
+    pub max_block_height: u64,
+    pub public_key: [u8; 32],
+}
+
+/// NEP-461 prefix of a signed delegate action: borsh u32 of 2^30 + 366.
+pub const DELEGATE_ACTION_PREFIX: u32 = (1 << 30) + 366;
+
+/// Same strictness as `decode`: FunctionCall only, ed25519 only, no trailing byte.
+pub fn decode_delegate(bytes: &[u8]) -> Result<DelegateAction, DecodeError> {
+    let mut r = Reader { bytes, at: 0 };
+    let sender_id = r.string("sender_id")?;
+    let receiver_id = r.string("receiver_id")?;
+    let count = r.u32()? as usize;
+    if count > MAX_ACTIONS {
+        return Err(DecodeError::TooLong("actions"));
+    }
+    let mut actions = Vec::with_capacity(count);
+    for _ in 0..count {
+        let kind = r.u8()?;
+        if kind != ACTION_FUNCTION_CALL {
+            return Err(DecodeError::UnsupportedAction(kind));
+        }
+        let method_name = r.string("method_name")?;
+        let args = r.bytes(MAX_ARGS, "args")?;
+        let gas = r.u64()?;
+        let deposit = r.u128()?;
+        actions.push(Action::FunctionCall(FunctionCall {
+            method_name,
+            args,
+            gas,
+            deposit,
+        }));
+    }
+    let nonce = r.u64()?;
+    let max_block_height = r.u64()?;
+    let public_key = r.public_key()?;
+    if r.at != bytes.len() {
+        return Err(DecodeError::TrailingBytes);
+    }
+    Ok(DelegateAction {
+        sender_id,
+        receiver_id,
+        actions,
+        nonce,
+        max_block_height,
+        public_key,
+    })
+}
+
+/// Borsh encoding of a delegate action (tests, and callers that build one).
+pub fn encode_delegate(delegate: &DelegateAction) -> Vec<u8> {
+    let mut out = Vec::new();
+    let string = |out: &mut Vec<u8>, s: &str| {
+        out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        out.extend_from_slice(s.as_bytes());
+    };
+    string(&mut out, &delegate.sender_id);
+    string(&mut out, &delegate.receiver_id);
+    out.extend_from_slice(&(delegate.actions.len() as u32).to_le_bytes());
+    for action in &delegate.actions {
+        if let Action::FunctionCall(call) = action {
+            out.push(ACTION_FUNCTION_CALL);
+            string(&mut out, &call.method_name);
+            out.extend_from_slice(&(call.args.len() as u32).to_le_bytes());
+            out.extend_from_slice(&call.args);
+            out.extend_from_slice(&call.gas.to_le_bytes());
+            out.extend_from_slice(&call.deposit.to_le_bytes());
+        } else if let Action::Other(kind) = action {
+            out.push(*kind);
+        }
+    }
+    out.extend_from_slice(&delegate.nonce.to_le_bytes());
+    out.extend_from_slice(&delegate.max_block_height.to_le_bytes());
+    out.push(KEY_TYPE_ED25519);
+    out.extend_from_slice(&delegate.public_key);
+    out
+}
+
 /// Borsh encoding of a transaction, used by tests and by callers that build one.
 pub fn encode(tx: &Transaction) -> Vec<u8> {
     fn string(out: &mut Vec<u8>, s: &str) {

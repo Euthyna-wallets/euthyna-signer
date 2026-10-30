@@ -38,6 +38,11 @@ pub struct Config {
     /// Signatures per agent per minute.
     #[serde(default = "default_rate")]
     pub rate_per_minute: u32,
+    /// NEAR RPC used to read the current block height before signing a card
+    /// payment (bounds how long a cheque lives). Default: FastNEAR for the
+    /// agent's network.
+    #[serde(default)]
+    pub near_rpc_url: Option<String>,
 }
 
 fn default_rate() -> u32 {
@@ -131,6 +136,8 @@ struct Request {
     #[serde(default)]
     tx_borsh_b64: Option<String>,
     #[serde(default)]
+    delegate_borsh_b64: Option<String>,
+    #[serde(default)]
     method: Option<String>,
     #[serde(default)]
     path: Option<String>,
@@ -183,7 +190,30 @@ pub async fn handle_line(state: &State, uid: u32, line: &str) -> Value {
                 Err(error) => refuse("UNKNOWN_AGENT", error),
             }
         }
+        // The agent's spending card: public facts only.
+        "card_info" => {
+            let Some(agent) = request.agent.as_deref() else {
+                return refuse("BAD_REQUEST", "agent is required");
+            };
+            match state.store.load(agent) {
+                Ok(record) => match record.card.as_ref() {
+                    Some(card) if !card.account_id.is_empty() => match card.public_key() {
+                        Ok(public_key) => json!({
+                            "ok": true, "card": card.account_id, "token": card.token,
+                            "max_per_payment": card.max_per_payment, "public_key": public_key,
+                        }),
+                        Err(error) => refuse("AGENT_KEY_UNREADABLE", error),
+                    },
+                    _ => refuse(
+                        "NO_CARD",
+                        "this agent has no spending card: sudo euthyna-signer card <agent>",
+                    ),
+                },
+                Err(error) => refuse("UNKNOWN_AGENT", error),
+            }
+        }
         "sign_near_tx" => sign(state, uid, &request).await,
+        "sign_delegate" => sign_delegate(state, uid, &request).await,
         "api" => api(state, uid, &request).await,
         other => {
             state.audit.write(
@@ -246,6 +276,120 @@ async fn sign(state: &State, uid: u32, request: &Request) -> Value {
         "public_key": near_public_key(&key),
         "tx_hash": hash_b58,
     })
+}
+
+/// A payment from the agent's card: an `ft_transfer` delegate action (NEP-366)
+/// that a relayer (the market) sends. Signed over sha256(NEP-461 prefix + action).
+async fn sign_delegate(state: &State, uid: u32, request: &Request) -> Value {
+    let Some(agent_id) = request.agent.as_deref() else {
+        return refuse("BAD_REQUEST", "agent is required");
+    };
+    let Some(b64) = request.delegate_borsh_b64.as_deref() else {
+        return refuse("BAD_REQUEST", "delegate_borsh_b64 is required");
+    };
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(b64) {
+        Ok(bytes) => bytes,
+        Err(error) => return refuse("BAD_REQUEST", error),
+    };
+    let record = match state.store.load(agent_id) {
+        Ok(record) => record,
+        Err(error) => return refuse("UNKNOWN_AGENT", error),
+    };
+    let Some(card) = record
+        .card
+        .as_ref()
+        .filter(|card| !card.account_id.is_empty())
+    else {
+        let refusal = policy::Refusal::NoCard;
+        return refuse(refusal.code(), refusal);
+    };
+    let key = match card.signing_key() {
+        Ok(key) => key,
+        Err(error) => return refuse("AGENT_KEY_UNREADABLE", error),
+    };
+    let mut message = crate::tx::DELEGATE_ACTION_PREFIX.to_le_bytes().to_vec();
+    message.extend_from_slice(&bytes);
+    let hash: [u8; 32] = Sha256::digest(&message).into();
+    let hash_b58 = bs58::encode(hash).into_string();
+    // Fail closed: without the current height, nothing bounds the cheque's life.
+    let height = match block_height(state, &record.network_id).await {
+        Ok(height) => height,
+        Err(error) => {
+            let refusal = policy::Refusal::ChainUnreachable(error.to_string());
+            return refuse(refusal.code(), refusal);
+        }
+    };
+    let accepted = match policy::check_payment(
+        card,
+        &key.verifying_key().to_bytes(),
+        &bytes,
+        height,
+    ) {
+        Ok(accepted) => accepted,
+        Err(refusal) => {
+            state.audit.write(json!({
+                "uid": uid, "op": "sign_delegate", "agent": agent_id, "card": card.account_id, "result": "refused",
+                "error": refusal.code(), "detail": refusal.to_string(), "hash": hash_b58,
+            }));
+            return refuse(refusal.code(), refusal);
+        }
+    };
+    // Cards and vault calls share the agent's rate limit.
+    if !state.limiter.lock().await.allow(agent_id) {
+        state.audit.write(json!({ "uid": uid, "op": "sign_delegate", "agent": agent_id, "result": "refused", "error": "RATE_LIMITED" }));
+        return refuse(
+            "RATE_LIMITED",
+            format!(
+                "more than {} signatures a minute",
+                state.config.rate_per_minute
+            ),
+        );
+    }
+    let signature = key.sign(&hash);
+    state.audit.write(json!({
+        "uid": uid, "op": "sign_delegate", "agent": agent_id, "card": card.account_id, "result": "signed",
+        "token": card.token, "to": accepted.receiver_id, "amount": accepted.amount.to_string(),
+        "nonce": accepted.delegate.nonce, "max_block_height": accepted.delegate.max_block_height, "hash": hash_b58,
+    }));
+    json!({
+        "ok": true,
+        "signature": format!("ed25519:{}", bs58::encode(signature.to_bytes()).into_string()),
+        "public_key": near_public_key(&key),
+        "hash": hash_b58,
+    })
+}
+
+async fn http(state: &State) -> Result<&reqwest::Client> {
+    state
+        .http
+        .get_or_try_init(|| async {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .build()
+        })
+        .await
+        .context("set up HTTPS")
+}
+
+/// The final block height, from the configured RPC (or FastNEAR for the network).
+async fn block_height(state: &State, network: &str) -> Result<u64> {
+    let url = match (&state.config.near_rpc_url, network) {
+        (Some(url), _) => url.clone(),
+        (None, "testnet") => "https://rpc.testnet.fastnear.com".to_owned(),
+        (None, "mainnet") => "https://rpc.mainnet.fastnear.com".to_owned(),
+        (None, other) => anyhow::bail!("set near_rpc_url in the config for network {other}"),
+    };
+    let reply: Value = http(state)
+        .await?
+        .post(&url)
+        .json(&json!({ "jsonrpc": "2.0", "id": "euthyna-signer", "method": "block", "params": { "finality": "final" } }))
+        .send()
+        .await?
+        .json()
+        .await?;
+    reply["result"]["header"]["height"]
+        .as_u64()
+        .context("no block height in the RPC answer")
 }
 
 async fn api(state: &State, uid: u32, request: &Request) -> Value {

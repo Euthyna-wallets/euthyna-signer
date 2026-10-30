@@ -24,7 +24,11 @@ pub const DEFAULT_METHODS: &[&str] = &[
     "execute_solana",
     "settle_solana",
     "release_solana_unconfirmed",
+    "execute_near",
+    "release_near_unconfirmed",
 ];
+/// ft_transfer needs ~5 Tgas; the market requires 10 to 30.
+pub const CARD_MAX_GAS: u64 = 30_000_000_000_000;
 /// 300 Tgas: the protocol maximum for one transaction.
 pub const DEFAULT_MAX_GAS: u64 = 300_000_000_000_000;
 
@@ -54,6 +58,58 @@ pub struct AgentRecord {
     /// The role the agent was hired for, as the console named it (public).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// The agent's spending card, if it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card: Option<CardRecord>,
+}
+
+/// A spending card: a NEAR account next to the agent's, holding a few tokens
+/// the vault refills by role. Its key is a full-access key (function-call keys
+/// cannot attach the 1 yoctoNEAR ft_transfer needs), so the signer signs only
+/// `ft_transfer` delegate actions on one token, up to a cap per payment.
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+pub struct CardRecord {
+    pub account_id: String,
+    /// The only NEP-141 token the card pays with.
+    pub token: String,
+    /// Largest payment, in the token's base units, as a decimal string.
+    pub max_per_payment: String,
+    secret_seed: String,
+}
+
+impl CardRecord {
+    pub fn new(account_id: &str, token: &str, max_per_payment: u128) -> Self {
+        CardRecord {
+            account_id: account_id.to_owned(),
+            token: token.to_owned(),
+            max_per_payment: max_per_payment.to_string(),
+            secret_seed: new_seed(),
+        }
+    }
+
+    /// A key made here before the account exists: the API creates the account with its public key.
+    pub fn unassigned(token: &str, max_per_payment: u128) -> Self {
+        CardRecord::new("", token, max_per_payment)
+    }
+
+    /// The same key, now bound to the account the API created.
+    pub fn with_account(mut card: CardRecord, account_id: &str, max_per_payment: u128) -> Self {
+        card.account_id = account_id.to_owned();
+        card.max_per_payment = max_per_payment.to_string();
+        card
+    }
+
+    pub fn signing_key(&self) -> Result<SigningKey> {
+        decode_seed(&self.secret_seed)
+    }
+
+    pub fn public_key(&self) -> Result<String> {
+        Ok(near_public_key(&self.signing_key()?))
+    }
+
+    pub fn max(&self) -> Result<u128> {
+        self.max_per_payment.parse().context("max_per_payment")
+    }
 }
 
 fn decode_seed(seed: &str) -> Result<SigningKey> {
@@ -102,6 +158,7 @@ impl AgentRecord {
             next_secret_seed: None,
             api,
             role: None,
+            card: None,
         }
     }
 
