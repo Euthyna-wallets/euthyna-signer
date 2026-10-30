@@ -32,6 +32,7 @@ the key, export it, or have it sign anything else.
 | use the agent API key for something else | only the agent endpoints are forwarded (`PATH_NOT_ALLOWED` otherwise) |
 | connect from another system user | refused: `UID_NOT_ALLOWED` (kernel-checked peer credentials) |
 | sign in a loop | refused after `rate_per_minute`: `RATE_LIMITED` |
+| stockpile cheques to spend after a revocation | each cheque expires within 200 000 blocks of the chain's height, read before signing (`EXPIRES_TOO_LATE`); no height, no signature (`CHAIN_UNREACHABLE`) |
 | read the audit log | `Permission denied` |
 
 The signer receives the **whole unsigned transaction**, never a hash, so it
@@ -68,6 +69,22 @@ registers it on the token. The card key is a **full-access** key, because functi
 1 yoctoNEAR `ft_transfer` requires (NEAR refuses with `DepositWithFunctionCall`). That is why the signer, not
 the chain, limits it: one token, `ft_transfer` only, a cap per payment, the agent's rate limit. The most a
 stolen agent can spend is the card's balance, which the vault's role caps per day.
+
+Rules on every cheque, besides the above:
+
+- **Canonical arguments.** The `ft_transfer` arguments must be exactly
+  `{"receiver_id":"…","amount":"…"}`, with an optional `"memo"` last, and nothing else: no duplicate keys,
+  no other order, no spaces. Whatever the signer checked is therefore what the token contract reads.
+- **Short life.** A cheque may not stay valid for more than 200 000 blocks (about a day and a half on
+  testnet). Before signing, the signer reads the chain's height. It uses `near_rpc_url` in the config,
+  or FastNEAR for testnet and mainnet. If it cannot read the height, it signs nothing
+  (`CHAIN_UNREACHABLE`).
+- **The AI cannot make the card.** The `api` op does not expose `POST /v1/agent/card`, so only
+  `euthyna-signer card`, run by the operator as root, can create one.
+
+**Stopping a card.** There is no revoke command yet. To stop a card, take its tokens out from the vault:
+stop refilling and move the balance back. The cheques already signed then have nothing to pay with, and
+they expire within the bound above.
 
 ## Protocol
 

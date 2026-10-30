@@ -83,6 +83,7 @@ async fn pairs_with_the_public_key_only_and_keeps_the_api_key() {
         state_dir: dir.path().join("state"),
         audit_log: dir.path().join("audit.log"),
         rate_per_minute: 10,
+        near_rpc_url: None,
     };
     Store::open(&config.state_dir)
         .unwrap()

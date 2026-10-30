@@ -26,6 +26,7 @@ fn config(dir: &Path, allowed_uids: Vec<u32>, rate: u32) -> Config {
         state_dir: dir.join("state"),
         audit_log: dir.join("audit.log"),
         rate_per_minute: rate,
+        near_rpc_url: None,
     }
 }
 

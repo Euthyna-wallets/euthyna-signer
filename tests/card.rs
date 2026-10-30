@@ -22,8 +22,42 @@ fn me() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-fn setup(dir: &Path, with_card: bool) -> (State, Option<CardRecord>) {
+/// A one-route NEAR RPC: `block` answers height 1000.
+async fn rpc() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buffer = vec![0u8; 8192];
+                let _ = stream.read(&mut buffer).await;
+                let body = r#"{"jsonrpc":"2.0","id":"x","result":{"header":{"height":1000}}}"#;
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes()).await;
+            });
+        }
+    });
+    format!("http://{address}")
+}
+
+async fn setup(dir: &Path, with_card: bool) -> (State, Option<CardRecord>) {
+    setup_with(dir, with_card, Some(rpc().await))
+}
+
+fn setup_with(
+    dir: &Path,
+    with_card: bool,
+    near_rpc_url: Option<String>,
+) -> (State, Option<CardRecord>) {
     let config = Config {
+        near_rpc_url,
         socket_path: dir.join("signer.sock"),
         socket_gid: None,
         allowed_uids: vec![me()],
@@ -56,7 +90,7 @@ fn payment(card: &CardRecord, receiver: &str, actions: Vec<Action>) -> DelegateA
         receiver_id: receiver.into(),
         actions,
         nonce: 42,
-        max_block_height: 1_000_000,
+        max_block_height: 5_000,
         public_key: card.signing_key().unwrap().verifying_key().to_bytes(),
     }
 }
@@ -82,7 +116,7 @@ fn error(reply: &Value) -> &str {
 #[tokio::test]
 async fn signs_an_ft_transfer_and_the_signature_is_the_one_near_checks() {
     let dir = tempfile::tempdir().unwrap();
-    let (state, card) = setup(dir.path(), true);
+    let (state, card) = setup(dir.path(), true).await;
     let card = card.unwrap();
     let delegate = payment(
         &card,
@@ -113,7 +147,7 @@ async fn signs_an_ft_transfer_and_the_signature_is_the_one_near_checks() {
 #[tokio::test]
 async fn refuses_everything_that_is_not_a_capped_token_payment() {
     let dir = tempfile::tempdir().unwrap();
-    let (state, card) = setup(dir.path(), true);
+    let (state, card) = setup(dir.path(), true).await;
     let card = card.unwrap();
     let ok = good_args("1000000");
     let cases: Vec<(DelegateAction, &str)> = vec![
@@ -262,7 +296,7 @@ async fn refuses_everything_that_is_not_a_capped_token_payment() {
 #[tokio::test]
 async fn no_card_no_signature_and_the_card_key_never_signs_vault_calls() {
     let dir = tempfile::tempdir().unwrap();
-    let (state, _) = setup(dir.path(), false);
+    let (state, _) = setup(dir.path(), false).await;
     let card = CardRecord::with_account(CardRecord::unassigned(USDC, 1), CARD, 1);
     assert_eq!(
         error(
@@ -290,7 +324,7 @@ async fn no_card_no_signature_and_the_card_key_never_signs_vault_calls() {
 #[tokio::test]
 async fn card_info_is_public_facts_only() {
     let dir = tempfile::tempdir().unwrap();
-    let (state, card) = setup(dir.path(), true);
+    let (state, card) = setup(dir.path(), true).await;
     let info = handle_line(
         &state,
         me(),
@@ -302,6 +336,74 @@ async fn card_info_is_public_facts_only() {
     assert_eq!(info["max_per_payment"], "5000000");
     assert_eq!(info["public_key"], card.unwrap().public_key().unwrap());
     assert!(!info.to_string().contains("seed"));
+}
+
+#[tokio::test]
+async fn cheques_cannot_outlive_a_few_thousand_blocks_or_hide_duplicate_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, card) = setup(dir.path(), true).await;
+    let card = card.unwrap();
+    let mut late = payment(
+        &card,
+        USDC,
+        vec![transfer(&good_args("1000000"), 30_000_000_000_000, 1)],
+    );
+    late.max_block_height = 1_000 + euthyna_signer::policy::MAX_CHEQUE_BLOCKS + 1;
+    assert_eq!(error(&sign(&state, &late).await), "EXPIRES_TOO_LATE");
+    late.max_block_height = u64::MAX;
+    assert_eq!(error(&sign(&state, &late).await), "EXPIRES_TOO_LATE");
+    // Duplicate keys, other order, spaces: refused, even when the values look fine.
+    for args in [
+        format!(r#"{{"receiver_id":"{SELLER}","amount":"6000000","amount":"1"}}"#),
+        format!(r#"{{"amount":"1","receiver_id":"{SELLER}"}}"#),
+        format!(r#"{{ "receiver_id":"{SELLER}","amount":"1"}}"#),
+    ] {
+        assert_eq!(
+            error(
+                &sign(
+                    &state,
+                    &payment(&card, USDC, vec![transfer(&args, 30_000_000_000_000, 1)])
+                )
+                .await
+            ),
+            "MALFORMED_TRANSACTION",
+            "{args}"
+        );
+    }
+    let memo = format!(r#"{{"receiver_id":"{SELLER}","amount":"1","memo":"market:t1"}}"#);
+    assert_eq!(
+        sign(
+            &state,
+            &payment(&card, USDC, vec![transfer(&memo, 30_000_000_000_000, 1)])
+        )
+        .await["ok"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn refuses_to_sign_when_it_cannot_read_the_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, card) = setup_with(dir.path(), true, Some("http://127.0.0.1:9".into()));
+    let card = card.unwrap();
+    let reply = sign(
+        &state,
+        &payment(
+            &card,
+            USDC,
+            vec![transfer(&good_args("1"), 30_000_000_000_000, 1)],
+        ),
+    )
+    .await;
+    assert_eq!(error(&reply), "CHAIN_UNREACHABLE");
+}
+
+#[test]
+fn the_ai_cannot_create_the_card_through_the_api_op() {
+    assert!(!euthyna_signer::policy::api_path_allowed(
+        "POST",
+        "/v1/agent/card"
+    ));
 }
 
 #[test]

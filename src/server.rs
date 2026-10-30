@@ -38,6 +38,11 @@ pub struct Config {
     /// Signatures per agent per minute.
     #[serde(default = "default_rate")]
     pub rate_per_minute: u32,
+    /// NEAR RPC used to read the current block height before signing a card
+    /// payment (bounds how long a cheque lives). Default: FastNEAR for the
+    /// agent's network.
+    #[serde(default)]
+    pub near_rpc_url: Option<String>,
 }
 
 fn default_rate() -> u32 {
@@ -306,7 +311,20 @@ async fn sign_delegate(state: &State, uid: u32, request: &Request) -> Value {
     message.extend_from_slice(&bytes);
     let hash: [u8; 32] = Sha256::digest(&message).into();
     let hash_b58 = bs58::encode(hash).into_string();
-    let accepted = match policy::check_payment(card, &key.verifying_key().to_bytes(), &bytes) {
+    // Fail closed: without the current height, nothing bounds the cheque's life.
+    let height = match block_height(state, &record.network_id).await {
+        Ok(height) => height,
+        Err(error) => {
+            let refusal = policy::Refusal::ChainUnreachable(error.to_string());
+            return refuse(refusal.code(), refusal);
+        }
+    };
+    let accepted = match policy::check_payment(
+        card,
+        &key.verifying_key().to_bytes(),
+        &bytes,
+        height,
+    ) {
         Ok(accepted) => accepted,
         Err(refusal) => {
             state.audit.write(json!({
@@ -339,6 +357,39 @@ async fn sign_delegate(state: &State, uid: u32, request: &Request) -> Value {
         "public_key": near_public_key(&key),
         "hash": hash_b58,
     })
+}
+
+async fn http(state: &State) -> Result<&reqwest::Client> {
+    state
+        .http
+        .get_or_try_init(|| async {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .build()
+        })
+        .await
+        .context("set up HTTPS")
+}
+
+/// The final block height, from the configured RPC (or FastNEAR for the network).
+async fn block_height(state: &State, network: &str) -> Result<u64> {
+    let url = match (&state.config.near_rpc_url, network) {
+        (Some(url), _) => url.clone(),
+        (None, "testnet") => "https://rpc.testnet.fastnear.com".to_owned(),
+        (None, "mainnet") => "https://rpc.mainnet.fastnear.com".to_owned(),
+        (None, other) => anyhow::bail!("set near_rpc_url in the config for network {other}"),
+    };
+    let reply: Value = http(state)
+        .await?
+        .post(&url)
+        .json(&json!({ "jsonrpc": "2.0", "id": "euthyna-signer", "method": "block", "params": { "finality": "final" } }))
+        .send()
+        .await?
+        .json()
+        .await?;
+    reply["result"]["header"]["height"]
+        .as_u64()
+        .context("no block height in the RPC answer")
 }
 
 async fn api(state: &State, uid: u32, request: &Request) -> Value {
