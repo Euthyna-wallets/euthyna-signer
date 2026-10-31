@@ -143,7 +143,7 @@ Then plug the agent into the AI. The config holds no secret: the MCP server
 finds the socket and reads the vault, role and network from the signer.
 
 ```bash
-claude mcp add euthyna --env EUTHYNA_AGENT=<agent>.testnet -- npx -y @euthyna/mcp
+claude mcp add euthyna --env EUTHYNA_AGENT=<agent>.testnet -- npx -y https://euthyna.io/mcp/euthyna-mcp.tgz
 ```
 
 Without the console (or offline), `sudo euthyna-signer add-agent <account>

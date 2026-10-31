@@ -261,9 +261,11 @@ async fn run(cli: Cli) -> Result<()> {
             );
             println!("  The console now creates the agent's NEAR account; keep it open.\n");
             println!("  Then plug it into your AI (no secret in it):\n");
+            // The console serves the MCP package until @euthyna/mcp is on npm.
             println!(
-                "      claude mcp add euthyna --env EUTHYNA_AGENT={} -- npx -y @euthyna/mcp\n",
-                record.account_id
+                "      claude mcp add euthyna --env EUTHYNA_AGENT={} -- npx -y {}/mcp/euthyna-mcp.tgz\n",
+                record.account_id,
+                api_url.trim_end_matches('/')
             );
             Ok(())
         }
