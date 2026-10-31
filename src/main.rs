@@ -261,8 +261,12 @@ async fn run(cli: Cli) -> Result<()> {
             );
             println!("  The console now creates the agent's NEAR account; keep it open.\n");
             println!("  Then plug it into your AI (no secret in it):\n");
+            // Until @euthyna/mcp is on npm, the MCP server runs from a clone of the repository.
             println!(
-                "      claude mcp add euthyna --env EUTHYNA_AGENT={} -- npx -y @euthyna/mcp\n",
+                "      git clone https://github.com/Euthyna-wallets/MandateOS && cd MandateOS && pnpm install"
+            );
+            println!(
+                "      claude mcp add euthyna --env EUTHYNA_AGENT={} -- pnpm --silent --dir \"$PWD/packages/mcp\" exec tsx src/server.ts\n",
                 record.account_id
             );
             Ok(())
